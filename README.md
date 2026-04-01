@@ -1,53 +1,48 @@
 # ICMP ISAV Prober
 
-该仓库实现了论文中的两种互补探测逻辑：
+支持两类 ICMP 探测（Unreachable / Fragmentation）并新增**隧道协议封装扫描**：
 
-1. **ICMP Unreachable 方法**：利用伪造 ICMP 不可达报文观察 TCP 重传是否中断。
-2. **ICMP Fragmentation 方法**：利用伪造 ICMP Fragment Needed 报文观察目标是否按伪造 PMTU 触发分片回复。
+- `ipip`
+- `gre`
+- `ip6ip6`
+- `gre6`
+- `4in6`
+- `6to4`
 
-主程序：`icmp_isav_probe.py`
+并支持：
 
-## 功能对应关系
+- **IPv4**：按网段批量扫描（默认 `0.0.0.0/0`，即全网）。
+- **IPv6**：从你提供的 `csv/txt` 数据集读取目标（每行一个地址；CSV 时取首列）。
+- 最终输出疑似**未部署 ISAV** 地址到 CSV。
 
-### 阶段 1：可测目标筛选
-
-- `measure-unreach`
-  - 对目标端口执行两轮 SYN/SYN-ACK 重传测量，得到 `n1`（基准）与 `n2`（中断）。
-  - 判定规则：`n1 - n2 >= 2` => 可测。
-
-- `measure-frag`
-  - 先发 1300-byte payload ping 观察基准是否分片；
-  - 再发 ICMP Fragment Needed 后重测；
-  - 判定规则：第一次不分片、第二次分片 => 可测。
-
-### 阶段 2：ISAV 伪造探测
-
-- `probe-unreach`
-  - 发送 SYN；
-  - 收到 SYN/ACK 后发送伪造源地址（默认目标邻居 IP）的 ICMP Unreachable；
-  - 比较重传数量变化。
-
-- `probe-frag`
-  - 发送伪造源地址（默认目标邻居 IP）的 ICMP Fragment Needed（MTU=1300）；
-  - 之后发送 1300-byte payload ping；
-  - 观察 Echo Reply 是否分片。
-
-### 阶段 3：结果判定
-
-- `packet_not_intercepted`：伪造包穿透（疑似未部署 ISAV）。
-- `packet_intercepted`：伪造包被拦截（疑似已部署 ISAV）。
-- `inconclusive`：无应答或证据不足。
-
-## 运行示例
-
-> 需要 root 权限和可发送原始报文的网络环境。
+## 核心命令
 
 ```bash
-python3 icmp_isav_probe.py measure-unreach 203.0.113.10 --ports 22,80,443
-python3 icmp_isav_probe.py measure-frag 203.0.113.10
-python3 icmp_isav_probe.py probe-unreach 203.0.113.10 --port 80
-python3 icmp_isav_probe.py probe-frag 203.0.113.10
+python3 icmp_isav_probe.py scan --ip-version 4 --ipv4-cidr 0.0.0.0/0 --methods both --tunnel gre --output-csv not_deployed_isav_v4.csv
+
+python3 icmp_isav_probe.py scan --ip-version 6 --targets-file ipv6_targets.csv --tunnel gre6 --output-csv not_deployed_isav_v6.csv
 ```
+
+## 参数说明
+
+- `--ip-version {4,6}`：选择 IPv4 或 IPv6 扫描。
+- `--ipv4-cidr`：IPv4 扫描网段，默认全网 `0.0.0.0/0`。
+- `--targets-file`：IPv6 目标文件（CSV/TXT）。
+- `--methods {both,unreach,frag}`：IPv4 下探测方法组合。
+- `--port`：Unreachable 方法目标端口，默认 `80`。
+- `--tunnel`：隧道协议 `ipip|gre|ip6ip6|gre6|4in6|6to4`。
+- `--output-csv`：输出“未部署 ISAV”结果文件。
+- `--iface`：可选网卡。
+
+## 输出格式
+
+输出 CSV 列：
+
+- `target`
+- `method`
+- `status`
+
+仅输出 `status = packet_not_intercepted` 的地址。
 
 ## 依赖
 
@@ -57,3 +52,8 @@ python3 icmp_isav_probe.py probe-frag 203.0.113.10
 ```bash
 pip install scapy
 ```
+
+## 说明
+
+- 运行扫描通常需要 root/raw socket 权限。
+- 全网 IPv4 扫描规模极大，建议先用较小 CIDR 验证。

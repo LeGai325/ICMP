@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
-"""ISAV probing implementation for ICMP Unreachable and Fragmentation methods.
+"""ISAV probing implementation with tunnel-packet support.
 
-This module follows the methodology described in the paper/workflow:
-1) measurable target filtering
-2) spoofed probing
-3) result judgement
+Features:
+- ICMP Unreachable and ICMP Fragmentation probing logic (IPv4)
+- ICMPv6 Packet Too Big based fragmentation probing (IPv6)
+- Tunnel encapsulation options: ipip, gre, ip6ip6, gre6, 4in6, 6to4
+- IPv4 global scan mode (0.0.0.0/0 by default, configurable)
+- IPv6 dataset scan mode (CSV/TXT, one address per line)
+- CSV output of addresses inferred as "not deployed ISAV"
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import ipaddress
 import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import Iterable, List, Optional, Tuple
+from pathlib import Path
+from typing import Iterable, Iterator, List, Optional, Sequence, Tuple
 
-from scapy.all import ICMP, IP, TCP, Raw, conf, send, sr1, sniff
+from scapy.all import GRE, ICMP, ICMPv6EchoRequest, ICMPv6PacketTooBig, IP, IPv6, Raw, TCP, conf, send, sr1, sniff
 
 
 class IsavStatus(str, Enum):
@@ -25,57 +30,40 @@ class IsavStatus(str, Enum):
     INCONCLUSIVE = "inconclusive"
 
 
-@dataclass
-class UnreachableMeasurableResult:
-    target: str
-    port: int
-    baseline_retransmissions: int
-    interrupted_retransmissions: int
-
-    @property
-    def measurable(self) -> bool:
-        return (self.baseline_retransmissions - self.interrupted_retransmissions) >= 2
+class TunnelProtocol(str, Enum):
+    IPIP = "ipip"
+    GRE = "gre"
+    IP6IP6 = "ip6ip6"
+    GRE6 = "gre6"
+    V4IN6 = "4in6"
+    SIX_TO_FOUR = "6to4"
 
 
 @dataclass
-class FragmentMeasurableResult:
+class ProbeDecision:
     target: str
-    baseline_fragmented: bool
-    downgraded_fragmented: bool
-
-    @property
-    def measurable(self) -> bool:
-        return (not self.baseline_fragmented) and self.downgraded_fragmented
+    method: str
+    status: IsavStatus
 
 
-@dataclass
-class UnreachableProbeResult:
-    target: str
-    port: int
-    spoofed_source: str
-    baseline_retransmissions: int
-    spoofed_retransmissions: int
+class TunnelPacketBuilder:
+    """Wrap an inner packet with a selected tunnel protocol."""
 
-    @property
-    def status(self) -> IsavStatus:
-        if (self.baseline_retransmissions - self.spoofed_retransmissions) >= 2:
-            return IsavStatus.NOT_INTERCEPTED
-        return IsavStatus.INTERCEPTED
-
-
-@dataclass
-class FragmentProbeResult:
-    target: str
-    spoofed_source: str
-    reply_fragmented: Optional[bool]
-
-    @property
-    def status(self) -> IsavStatus:
-        if self.reply_fragmented is True:
-            return IsavStatus.NOT_INTERCEPTED
-        if self.reply_fragmented is False:
-            return IsavStatus.INTERCEPTED
-        return IsavStatus.INCONCLUSIVE
+    @staticmethod
+    def wrap(inner_pkt, tunnel: TunnelProtocol, src: str, dst: str):
+        if tunnel == TunnelProtocol.IPIP:
+            return IP(src=src, dst=dst, proto=4) / inner_pkt
+        if tunnel == TunnelProtocol.GRE:
+            return IP(src=src, dst=dst) / GRE() / inner_pkt
+        if tunnel == TunnelProtocol.IP6IP6:
+            return IPv6(src=src, dst=dst, nh=41) / inner_pkt
+        if tunnel == TunnelProtocol.GRE6:
+            return IPv6(src=src, dst=dst) / GRE() / inner_pkt
+        if tunnel == TunnelProtocol.V4IN6:
+            return IPv6(src=src, dst=dst, nh=4) / inner_pkt
+        if tunnel == TunnelProtocol.SIX_TO_FOUR:
+            return IP(src=src, dst=dst, proto=41) / inner_pkt
+        raise ValueError(f"unsupported tunnel protocol: {tunnel}")
 
 
 class IsavProber:
@@ -85,10 +73,10 @@ class IsavProber:
 
     @staticmethod
     def neighbor_ip(target: str) -> str:
-        ip_obj = ipaddress.ip_address(target)
-        if int(ip_obj) == 0:
-            raise ValueError("cannot compute neighbor for zero address")
-        return str(ip_obj - 1)
+        obj = ipaddress.ip_address(target)
+        if int(obj) == 0:
+            raise ValueError("cannot compute neighbor for address zero")
+        return str(obj - 1)
 
     def _count_synack_retransmissions(
         self,
@@ -97,6 +85,7 @@ class IsavProber:
         timeout_s: float,
         interrupt_with_icmp_unreach: bool,
         interrupt_src_ip: Optional[str] = None,
+        tunnel: Optional[TunnelProtocol] = None,
     ) -> int:
         sport = 40000 + int(time.time() * 1000) % 20000
         syn = IP(dst=target) / TCP(sport=sport, dport=port, flags="S", seq=1000)
@@ -105,16 +94,19 @@ class IsavProber:
             return 0
 
         if interrupt_with_icmp_unreach:
-            outer_src = interrupt_src_ip if interrupt_src_ip else conf.route.route(target)[1]
-            inner = IP(src=target, dst=conf.route.route(target)[1]) / TCP(
+            scanner_ip = conf.route.route(target)[1]
+            outer_src = interrupt_src_ip if interrupt_src_ip else scanner_ip
+            inner = IP(src=target, dst=scanner_ip) / TCP(
                 sport=port,
                 dport=sport,
                 flags="SA",
                 seq=synack[TCP].seq,
                 ack=synack[TCP].ack,
             )
-            icmp_unreach = IP(src=outer_src, dst=target) / ICMP(type=3, code=1) / bytes(inner)[:28]
-            send(icmp_unreach, verbose=False)
+            crafted = IP(src=outer_src, dst=target) / ICMP(type=3, code=1) / bytes(inner)[:28]
+            if tunnel is not None:
+                crafted = TunnelPacketBuilder.wrap(crafted, tunnel=tunnel, src=outer_src, dst=target)
+            send(crafted, verbose=False)
 
         bpf = (
             f"tcp and src host {target} and src port {port} "
@@ -123,83 +115,20 @@ class IsavProber:
         packets = sniff(filter=bpf, timeout=timeout_s)
         return len(packets)
 
-    def measure_unreachable_targets(
+    def probe_unreachable_ipv4(
         self,
-        targets: Iterable[str],
-        ports: Iterable[int] = (22, 53, 80, 443),
-        timeout_s: float = 8.0,
-    ) -> List[UnreachableMeasurableResult]:
-        results: List[UnreachableMeasurableResult] = []
-        for target in targets:
-            for port in ports:
-                n1 = self._count_synack_retransmissions(
-                    target=target,
-                    port=port,
-                    timeout_s=timeout_s,
-                    interrupt_with_icmp_unreach=False,
-                )
-                n2 = self._count_synack_retransmissions(
-                    target=target,
-                    port=port,
-                    timeout_s=timeout_s,
-                    interrupt_with_icmp_unreach=True,
-                )
-                results.append(
-                    UnreachableMeasurableResult(
-                        target=target,
-                        port=port,
-                        baseline_retransmissions=n1,
-                        interrupted_retransmissions=n2,
-                    )
-                )
-        return results
-
-    def _send_fragment_needed(self, target: str, spoofed_source: str, mtu: int) -> None:
-        scanner_ip = conf.route.route(target)[1]
-        inner = IP(src=target, dst=scanner_ip) / ICMP(type=8, code=0) / Raw(b"A" * 8)
-        frag_needed = (
-            IP(src=spoofed_source, dst=target)
-            / ICMP(type=3, code=4, unused=mtu)
-            / bytes(inner)[:28]
-        )
-        send(frag_needed, verbose=False)
-
-    def _ping_fragmented_reply(self, target: str, payload_size: int) -> Optional[bool]:
-        req = IP(dst=target) / ICMP(type=8, code=0) / Raw(b"B" * payload_size)
-        rep = sr1(req, timeout=3, verbose=False)
-        if rep is None:
-            return None
-        return rep.flags.MF == 1 or rep.frag > 0
-
-    def measure_fragment_targets(
-        self,
-        targets: Iterable[str],
-        payload_size: int = 1300,
-        mtu: int = 1300,
-    ) -> List[FragmentMeasurableResult]:
-        results: List[FragmentMeasurableResult] = []
-        for target in targets:
-            baseline = self._ping_fragmented_reply(target, payload_size=payload_size)
-            spoofed = conf.route.route(target)[1]
-            self._send_fragment_needed(target, spoofed_source=spoofed, mtu=mtu)
-            time.sleep(2)
-            downgraded = self._ping_fragmented_reply(target, payload_size=payload_size)
-            results.append(
-                FragmentMeasurableResult(
-                    target=target,
-                    baseline_fragmented=bool(baseline),
-                    downgraded_fragmented=bool(downgraded),
-                )
-            )
-        return results
-
-    def probe_unreachable(self, target: str, port: int, spoofed_source: Optional[str] = None) -> UnreachableProbeResult:
+        target: str,
+        port: int = 80,
+        spoofed_source: Optional[str] = None,
+        tunnel: Optional[TunnelProtocol] = None,
+    ) -> ProbeDecision:
         source = spoofed_source or self.neighbor_ip(target)
         baseline = self._count_synack_retransmissions(
             target=target,
             port=port,
             timeout_s=8,
             interrupt_with_icmp_unreach=False,
+            tunnel=tunnel,
         )
         spoofed = self._count_synack_retransmissions(
             target=target,
@@ -207,77 +136,171 @@ class IsavProber:
             timeout_s=8,
             interrupt_with_icmp_unreach=True,
             interrupt_src_ip=source,
+            tunnel=tunnel,
         )
-        return UnreachableProbeResult(
-            target=target,
-            port=port,
-            spoofed_source=source,
-            baseline_retransmissions=baseline,
-            spoofed_retransmissions=spoofed,
-        )
+        status = IsavStatus.NOT_INTERCEPTED if (baseline - spoofed) >= 2 else IsavStatus.INTERCEPTED
+        return ProbeDecision(target=target, method="unreachable", status=status)
 
-    def probe_fragment(self, target: str, spoofed_source: Optional[str] = None) -> FragmentProbeResult:
+    def _send_fragment_needed_ipv4(
+        self,
+        target: str,
+        spoofed_source: str,
+        mtu: int,
+        tunnel: Optional[TunnelProtocol] = None,
+    ) -> None:
+        scanner_ip = conf.route.route(target)[1]
+        inner = IP(src=target, dst=scanner_ip) / ICMP(type=8, code=0) / Raw(b"A" * 8)
+        pkt = IP(src=spoofed_source, dst=target) / ICMP(type=3, code=4, unused=mtu) / bytes(inner)[:28]
+        if tunnel is not None:
+            pkt = TunnelPacketBuilder.wrap(pkt, tunnel=tunnel, src=spoofed_source, dst=target)
+        send(pkt, verbose=False)
+
+    def _send_packet_too_big_ipv6(
+        self,
+        target: str,
+        spoofed_source: str,
+        mtu: int,
+        tunnel: Optional[TunnelProtocol] = None,
+    ) -> None:
+        scanner_ip = conf.route6.route(target)[1]
+        inner = IPv6(src=target, dst=scanner_ip) / ICMPv6EchoRequest(data=b"A" * 8)
+        pkt = IPv6(src=spoofed_source, dst=target) / ICMPv6PacketTooBig(mtu=mtu) / bytes(inner)[:48]
+        if tunnel is not None:
+            pkt = TunnelPacketBuilder.wrap(pkt, tunnel=tunnel, src=spoofed_source, dst=target)
+        send(pkt, verbose=False)
+
+    @staticmethod
+    def _is_fragmented_ipv4(rep) -> Optional[bool]:
+        if rep is None:
+            return None
+        return rep.flags.MF == 1 or rep.frag > 0
+
+    @staticmethod
+    def _is_fragmented_ipv6(rep) -> Optional[bool]:
+        if rep is None:
+            return None
+        return rep.haslayer("IPv6ExtHdrFragment")
+
+    def probe_fragment_ipv4(
+        self,
+        target: str,
+        spoofed_source: Optional[str] = None,
+        tunnel: Optional[TunnelProtocol] = None,
+    ) -> ProbeDecision:
         source = spoofed_source or self.neighbor_ip(target)
-        self._send_fragment_needed(target=target, spoofed_source=source, mtu=1300)
+        self._send_fragment_needed_ipv4(target=target, spoofed_source=source, mtu=1300, tunnel=tunnel)
         time.sleep(2)
-        fragmented = self._ping_fragmented_reply(target, payload_size=1300)
-        return FragmentProbeResult(
-            target=target,
-            spoofed_source=source,
-            reply_fragmented=fragmented,
-        )
+        req = IP(dst=target) / ICMP(type=8, code=0) / Raw(b"B" * 1300)
+        rep = sr1(req, timeout=3, verbose=False)
+        frag = self._is_fragmented_ipv4(rep)
+        if frag is True:
+            status = IsavStatus.NOT_INTERCEPTED
+        elif frag is False:
+            status = IsavStatus.INTERCEPTED
+        else:
+            status = IsavStatus.INCONCLUSIVE
+        return ProbeDecision(target=target, method="fragment", status=status)
+
+    def probe_fragment_ipv6(
+        self,
+        target: str,
+        spoofed_source: Optional[str] = None,
+        tunnel: Optional[TunnelProtocol] = None,
+    ) -> ProbeDecision:
+        source = spoofed_source or self.neighbor_ip(target)
+        self._send_packet_too_big_ipv6(target=target, spoofed_source=source, mtu=1300, tunnel=tunnel)
+        time.sleep(2)
+        req = IPv6(dst=target) / ICMPv6EchoRequest(data=b"B" * 1300)
+        rep = sr1(req, timeout=3, verbose=False)
+        frag = self._is_fragmented_ipv6(rep)
+        if frag is True:
+            status = IsavStatus.NOT_INTERCEPTED
+        elif frag is False:
+            status = IsavStatus.INTERCEPTED
+        else:
+            status = IsavStatus.INCONCLUSIVE
+        return ProbeDecision(target=target, method="fragment6", status=status)
 
 
-def _parse_ports(ports: str) -> Tuple[int, ...]:
-    return tuple(int(p.strip()) for p in ports.split(",") if p.strip())
+def load_ipv6_targets(file_path: str) -> List[str]:
+    targets: List[str] = []
+    path = Path(file_path)
+    with path.open("r", encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line:
+                continue
+            first = line.split(",")[0].strip()
+            ip = ipaddress.ip_address(first)
+            if ip.version == 6:
+                targets.append(first)
+    return targets
+
+
+def iter_ipv4_targets(cidr: str) -> Iterator[str]:
+    net = ipaddress.ip_network(cidr, strict=False)
+    for ip in net:
+        if ip.version == 4:
+            yield str(ip)
+
+
+def write_not_intercepted_csv(rows: Sequence[ProbeDecision], out_csv: str) -> None:
+    with open(out_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["target", "method", "status"])
+        for row in rows:
+            if row.status == IsavStatus.NOT_INTERCEPTED:
+                writer.writerow([row.target, row.method, row.status.value])
+
+
+def run_scan(args: argparse.Namespace) -> None:
+    prober = IsavProber(iface=args.iface)
+    tunnel = TunnelProtocol(args.tunnel) if args.tunnel else None
+    positives: List[ProbeDecision] = []
+
+    if args.ip_version == 4:
+        for target in iter_ipv4_targets(args.ipv4_cidr):
+            if args.methods in ("both", "unreach"):
+                res = prober.probe_unreachable_ipv4(target=target, port=args.port, tunnel=tunnel)
+                print(f"[v4-unreach] {target} -> {res.status.value}")
+                positives.append(res)
+            if args.methods in ("both", "frag"):
+                res = prober.probe_fragment_ipv4(target=target, tunnel=tunnel)
+                print(f"[v4-frag] {target} -> {res.status.value}")
+                positives.append(res)
+    else:
+        if not args.targets_file:
+            raise ValueError("IPv6 扫描必须提供 --targets-file (csv/txt)")
+        for target in load_ipv6_targets(args.targets_file):
+            res = prober.probe_fragment_ipv6(target=target, tunnel=tunnel)
+            print(f"[v6-frag] {target} -> {res.status.value}")
+            positives.append(res)
+
+    write_not_intercepted_csv(positives, args.output_csv)
+    print(f"已输出疑似未部署ISAV地址到: {args.output_csv}")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="ISAV ICMP probing tool")
+    parser = argparse.ArgumentParser(description="ISAV ICMP probing tool with tunnel support")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    m1 = sub.add_parser("measure-unreach")
-    m1.add_argument("targets", nargs="+")
-    m1.add_argument("--ports", default="22,53,80,443")
-
-    m2 = sub.add_parser("measure-frag")
-    m2.add_argument("targets", nargs="+")
-
-    p1 = sub.add_parser("probe-unreach")
-    p1.add_argument("target")
-    p1.add_argument("--port", type=int, default=80)
-    p1.add_argument("--spoofed-source")
-
-    p2 = sub.add_parser("probe-frag")
-    p2.add_argument("target")
-    p2.add_argument("--spoofed-source")
+    scan = sub.add_parser("scan", help="批量扫描并导出未部署ISAV地址CSV")
+    scan.add_argument("--ip-version", type=int, choices=[4, 6], required=True)
+    scan.add_argument("--ipv4-cidr", default="0.0.0.0/0", help="IPv4扫描网段，默认全网")
+    scan.add_argument("--targets-file", help="IPv6目标CSV/TXT文件，每行一个地址（可带逗号附加列）")
+    scan.add_argument("--methods", choices=["both", "unreach", "frag"], default="both")
+    scan.add_argument("--port", type=int, default=80, help="Unreachable方法使用的TCP目标端口")
+    scan.add_argument(
+        "--tunnel",
+        choices=[t.value for t in TunnelProtocol],
+        help="隧道协议: ipip, gre, ip6ip6, gre6, 4in6, 6to4",
+    )
+    scan.add_argument("--output-csv", default="not_deployed_isav.csv")
+    scan.add_argument("--iface", default=None)
 
     args = parser.parse_args()
-    prober = IsavProber()
-
-    if args.cmd == "measure-unreach":
-        results = prober.measure_unreachable_targets(args.targets, ports=_parse_ports(args.ports))
-        for item in results:
-            print(
-                f"{item.target}:{item.port} n1={item.baseline_retransmissions} "
-                f"n2={item.interrupted_retransmissions} measurable={item.measurable}"
-            )
-    elif args.cmd == "measure-frag":
-        results = prober.measure_fragment_targets(args.targets)
-        for item in results:
-            print(
-                f"{item.target} baseline_fragmented={item.baseline_fragmented} "
-                f"downgraded_fragmented={item.downgraded_fragmented} measurable={item.measurable}"
-            )
-    elif args.cmd == "probe-unreach":
-        res = prober.probe_unreachable(args.target, port=args.port, spoofed_source=args.spoofed_source)
-        print(
-            f"{res.target}:{res.port} baseline={res.baseline_retransmissions} "
-            f"spoofed={res.spoofed_retransmissions} status={res.status.value}"
-        )
-    else:
-        res = prober.probe_fragment(args.target, spoofed_source=args.spoofed_source)
-        print(f"{res.target} reply_fragmented={res.reply_fragmented} status={res.status.value}")
+    if args.cmd == "scan":
+        run_scan(args)
 
 
 if __name__ == "__main__":
