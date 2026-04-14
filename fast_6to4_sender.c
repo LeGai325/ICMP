@@ -185,7 +185,7 @@ static int64_t now_ns(void) {
 
 int main(int argc, char **argv) {
     if (argc < 4) {
-        fprintf(stderr, "Usage: %s <scanner_v4> <scanner_v6> <targets_v4.txt|--full-v4> [pps]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <scanner_v4> <scanner_v6> <targets_v4.txt|--full-v4> [pps] [output_csv]\n", argv[0]);
         return 1;
     }
 
@@ -193,13 +193,23 @@ int main(int argc, char **argv) {
     const char *scanner_v6 = argv[2];
     const char *targets_arg = argv[3];
     int pps = (argc >= 5) ? atoi(argv[4]) : 10000;
+    const char *output_csv = (argc >= 6) ? argv[5] : "c_sent_v4.csv";
     if (pps <= 0) {
         pps = 10000;
     }
 
+    FILE *out = fopen(output_csv, "w");
+    if (!out) {
+        perror("fopen(output_csv)");
+        return 1;
+    }
+    setvbuf(out, NULL, _IOFBF, 1 << 20);
+    fprintf(out, "target_v4,status\n");
+
     int fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
     if (fd < 0) {
         perror("socket");
+        fclose(out);
         return 1;
     }
 
@@ -207,6 +217,7 @@ int main(int argc, char **argv) {
     if (setsockopt(fd, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one)) < 0) {
         perror("setsockopt(IP_HDRINCL)");
         close(fd);
+        fclose(out);
         return 1;
     }
 
@@ -251,6 +262,7 @@ int main(int argc, char **argv) {
                 continue;
             }
             sent++;
+            fprintf(out, "%s,sent\n", target_ip);
             if (sent % 10000 == 0) {
                 fprintf(stdout, "sent=%" PRIu64 " pps=%d last=%s\n", sent, pps, target_ip);
                 fflush(stdout);
@@ -261,6 +273,7 @@ int main(int argc, char **argv) {
         if (!fp) {
             perror("fopen");
             close(fd);
+            fclose(out);
             return 1;
         }
 
@@ -304,6 +317,7 @@ int main(int argc, char **argv) {
                 continue;
             }
             sent++;
+            fprintf(out, "%s,sent\n", line);
             if (sent % 10000 == 0) {
                 fprintf(stdout, "sent=%" PRIu64 " pps=%d\n", sent, pps);
                 fflush(stdout);
@@ -312,7 +326,8 @@ int main(int argc, char **argv) {
         fclose(fp);
     }
 
-    fprintf(stdout, "done, sent=%" PRIu64 "\n", sent);
+    fprintf(stdout, "done, sent=%" PRIu64 ", output=%s\n", sent, output_csv);
     close(fd);
+    fclose(out);
     return 0;
 }

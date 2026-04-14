@@ -55,13 +55,13 @@ gcc -O3 -std=c11 -Wall -Wextra -o fast_6to4_sender fast_6to4_sender.c
 ### 运行（10000 pps）
 
 ```bash
-sudo ./fast_6to4_sender 1.1.1.1 2001:db8::1 targets_v4.txt 10000
+sudo ./fast_6to4_sender 1.1.1.1 2001:db8::1 targets_v4.txt 10000 c_sent_v4.csv
 ```
 
 ### 全网 IPv4（6to4）高速扫描
 
 ```bash
-sudo ./fast_6to4_sender 1.1.1.1 2001:db8::1 --full-v4 10000
+sudo ./fast_6to4_sender 1.1.1.1 2001:db8::1 --full-v4 10000 c_sent_v4.csv
 ```
 
 参数含义：
@@ -70,11 +70,14 @@ sudo ./fast_6to4_sender 1.1.1.1 2001:db8::1 --full-v4 10000
 2. `scanner_v6`：扫描器内层 IPv6
 3. `targets_v4.txt`：目标 IPv4 列表
 4. `pps`：每秒发包速率（默认 10000）
+5. `output_csv`：C 发包结果输出（默认 `c_sent_v4.csv`，保存 `target_v4,status`）
 
 ## 输出
 
 Python 扫描最终输出 CSV 仅包含一列：`target_v4`。  
 仅写入判定为 `packet_not_intercepted` 的 IPv4 地址（用于无状态入站源地址验证 ISAV 部署结果汇总）。
+
+C 发包器也会保存输出 CSV（`target_v4,status`），记录成功发送的 IPv4 目标。
 
 ## 依赖
 
