@@ -17,7 +17,7 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Iterator, List, Optional, Sequence
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 from scapy.all import (
     GRE,
@@ -58,6 +58,7 @@ class ProbeDecision:
     target: str
     method: str
     status: IsavStatus
+    note: str = ""
 
 
 class TunnelPacketBuilder:
@@ -145,6 +146,18 @@ class IsavProber:
         packets = sniff(filter=bpf, timeout=timeout_s)
         return len(packets)
 
+    def find_measurable_unreachable_port(self, target: str, ports: Sequence[int]) -> Tuple[Optional[int], Dict[int, Tuple[int, int]]]:
+        """阶段1：筛选对 ICMP Unreachable 有 RFC 兼容反应的目标端口。"""
+        details: Dict[int, Tuple[int, int]] = {}
+        scanner_ip = conf.route.route(target)[1]
+        for port in ports:
+            n1 = self._count_synack_retransmissions(target, port, 8, False)
+            n2 = self._count_synack_retransmissions(target, port, 8, True, scanner_ip, None)
+            details[port] = (n1, n2)
+            if (n1 - n2) >= 2:
+                return port, details
+        return None, details
+
     def probe_unreachable_ipv4(
         self,
         target: str,
@@ -156,7 +169,28 @@ class IsavProber:
         baseline = self._count_synack_retransmissions(target, port, 8, False)
         spoofed = self._count_synack_retransmissions(target, port, 8, True, source, tunnel)
         status = IsavStatus.NOT_INTERCEPTED if (baseline - spoofed) >= 2 else IsavStatus.INTERCEPTED
-        return ProbeDecision(target=target, method="unreachable", status=status)
+        return ProbeDecision(target=target, method="unreachable", status=status, note=f"port={port},n1={baseline},n2={spoofed}")
+
+    def _send_frag_needed_ipv4(self, target: str, source: str, tunnel: Optional[TunnelProtocol], mtu: int = 1300) -> None:
+        scanner_ip = conf.route.route(target)[1]
+        inner = IP(src=target, dst=scanner_ip) / ICMP(type=8, code=0) / Raw(b"A" * 8)
+        pkt = IP(src=source, dst=target) / ICMP(type=3, code=4, unused=mtu) / bytes(inner)[:28]
+        if tunnel is not None and tunnel != TunnelProtocol.SIX_TO_FOUR:
+            pkt = TunnelPacketBuilder.wrap(pkt, tunnel=tunnel, src=source, dst=target)
+        send(pkt, verbose=False)
+
+    def is_measurable_fragment_ipv4(self, target: str) -> bool:
+        """阶段1：筛选能被 Fragment Needed 报文影响 PMTU 的目标。"""
+        baseline = sr1(IP(dst=target) / ICMP(type=8, code=0) / Raw(b"B" * 1300), timeout=3, verbose=False)
+        if baseline is None or baseline.flags.MF == 1 or baseline.frag > 0:
+            return False
+        scanner_ip = conf.route.route(target)[1]
+        self._send_frag_needed_ipv4(target=target, source=scanner_ip, tunnel=None, mtu=1300)
+        time.sleep(2)
+        second = sr1(IP(dst=target) / ICMP(type=8, code=0) / Raw(b"B" * 1300), timeout=3, verbose=False)
+        if second is None:
+            return False
+        return second.flags.MF == 1 or second.frag > 0
 
     def probe_fragment_ipv4(
         self,
@@ -165,12 +199,7 @@ class IsavProber:
         tunnel: Optional[TunnelProtocol] = None,
     ) -> ProbeDecision:
         source = spoofed_source or self.neighbor_ip(target)
-        scanner_ip = conf.route.route(target)[1]
-        inner = IP(src=target, dst=scanner_ip) / ICMP(type=8, code=0) / Raw(b"A" * 8)
-        pkt = IP(src=source, dst=target) / ICMP(type=3, code=4, unused=1300) / bytes(inner)[:28]
-        if tunnel is not None and tunnel != TunnelProtocol.SIX_TO_FOUR:
-            pkt = TunnelPacketBuilder.wrap(pkt, tunnel=tunnel, src=source, dst=target)
-        send(pkt, verbose=False)
+        self._send_frag_needed_ipv4(target=target, source=source, tunnel=tunnel, mtu=1300)
         time.sleep(2)
         req = IP(dst=target) / ICMP(type=8, code=0) / Raw(b"B" * 1300)
         rep = sr1(req, timeout=3, verbose=False)
@@ -324,10 +353,9 @@ def load_ipv6_targets(file_path: str) -> List[str]:
             line = raw.strip()
             if not line:
                 continue
-            first = line.split(",")[0].strip()
-            ip = ipaddress.ip_address(first)
+            ip = ipaddress.ip_address(line)
             if ip.version == 6:
-                targets.append(first)
+                targets.append(line)
     return targets
 
 
@@ -338,19 +366,12 @@ def iter_ipv4_targets(cidr: str) -> Iterator[str]:
             yield str(ip)
 
 
-def write_not_intercepted_csv(rows: Sequence[ProbeDecision], out_csv: str) -> None:
+def write_results_csv(rows: Sequence[ProbeDecision], out_csv: str) -> None:
     with open(out_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["target_v4"])
+        writer.writerow(["target", "method", "status", "note"])
         for row in rows:
-            if row.status != IsavStatus.NOT_INTERCEPTED:
-                continue
-            try:
-                ip = ipaddress.ip_address(row.target)
-            except ValueError:
-                continue
-            if ip.version == 4:
-                writer.writerow([row.target])
+            writer.writerow([row.target, row.method, row.status.value, row.note])
 
 
 def run_scan(args: argparse.Namespace) -> None:
@@ -377,23 +398,30 @@ def run_scan(args: argparse.Namespace) -> None:
                     print(f"[6to4-unreach] {target} -> {r.status.value}")
             else:
                 if args.methods in ("both", "frag"):
-                    r = prober.probe_fragment_ipv4(target=target, tunnel=tunnel)
+                    if prober.is_measurable_fragment_ipv4(target):
+                        r = prober.probe_fragment_ipv4(target=target, tunnel=tunnel)
+                    else:
+                        r = ProbeDecision(target=target, method="fragment", status=IsavStatus.INCONCLUSIVE, note="not measurable")
                     decisions.append(r)
-                    print(f"[v4-frag] {target} -> {r.status.value}")
+                    print(f"[v4-frag] {target} -> {r.status.value} {r.note}")
                 if args.methods in ("both", "unreach"):
-                    r = prober.probe_unreachable_ipv4(target=target, port=args.port, tunnel=tunnel)
+                    selected_port, details = prober.find_measurable_unreachable_port(target, [22, 53, 80, 443] if args.port <= 0 else [args.port])
+                    if selected_port is None:
+                        r = ProbeDecision(target=target, method="unreachable", status=IsavStatus.INCONCLUSIVE, note=f"not measurable:{details}")
+                    else:
+                        r = prober.probe_unreachable_ipv4(target=target, port=selected_port, tunnel=tunnel)
                     decisions.append(r)
-                    print(f"[v4-unreach] {target} -> {r.status.value}")
+                    print(f"[v4-unreach] {target} -> {r.status.value} {r.note}")
     else:
         if not args.targets_file:
-            raise ValueError("IPv6 扫描必须提供 --targets-file (csv/txt)")
+            raise ValueError("IPv6 扫描必须提供 --targets-file (每行一个 IPv6 地址)")
         for target in load_ipv6_targets(args.targets_file):
             r = prober.probe_fragment_ipv6(target=target, tunnel=tunnel)
             decisions.append(r)
             print(f"[v6-frag] {target} -> {r.status.value}")
 
-    write_not_intercepted_csv(decisions, args.output_csv)
-    print(f"已输出疑似未部署ISAV地址到: {args.output_csv}")
+    write_results_csv(decisions, args.output_csv)
+    print(f"已输出扫描结果到: {args.output_csv}")
 
 
 def main() -> None:
@@ -405,7 +433,7 @@ def main() -> None:
     scan.add_argument("--ipv4-cidr", default="0.0.0.0/0", help="IPv4扫描网段（6to4模式下将被强制为0.0.0.0/0）")
     scan.add_argument("--targets-file", help="IPv6目标CSV/TXT文件，每行一个地址（可带逗号附加列）")
     scan.add_argument("--methods", choices=["both", "unreach", "frag"], default="both")
-    scan.add_argument("--port", type=int, default=80)
+    scan.add_argument("--port", type=int, default=-1, help="Unreachable探测端口，默认-1表示自动在22/53/80/443中筛选可测端口")
     scan.add_argument(
         "--tunnel",
         choices=[t.value for t in TunnelProtocol],
