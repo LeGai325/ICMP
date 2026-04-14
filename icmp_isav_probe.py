@@ -341,10 +341,16 @@ def iter_ipv4_targets(cidr: str) -> Iterator[str]:
 def write_not_intercepted_csv(rows: Sequence[ProbeDecision], out_csv: str) -> None:
     with open(out_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["target", "method", "status"])
+        writer.writerow(["target_v4"])
         for row in rows:
-            if row.status == IsavStatus.NOT_INTERCEPTED:
-                writer.writerow([row.target, row.method, row.status.value])
+            if row.status != IsavStatus.NOT_INTERCEPTED:
+                continue
+            try:
+                ip = ipaddress.ip_address(row.target)
+            except ValueError:
+                continue
+            if ip.version == 4:
+                writer.writerow([row.target])
 
 
 def run_scan(args: argparse.Namespace) -> None:
