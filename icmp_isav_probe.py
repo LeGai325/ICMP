@@ -353,7 +353,11 @@ def run_scan(args: argparse.Namespace) -> None:
     decisions: List[ProbeDecision] = []
 
     if args.ip_version == 4:
-        for target in iter_ipv4_targets(args.ipv4_cidr):
+        scan_cidr = args.ipv4_cidr
+        if tunnel == TunnelProtocol.SIX_TO_FOUR:
+            scan_cidr = "0.0.0.0/0"
+            print("[info] 6to4 模式固定扫描全网 IPv4: 0.0.0.0/0")
+        for target in iter_ipv4_targets(scan_cidr):
             if tunnel == TunnelProtocol.SIX_TO_FOUR:
                 if not args.scanner_v4 or not args.scanner_v6:
                     raise ValueError("6to4 扫描需要 --scanner-v4 和 --scanner-v6")
@@ -392,7 +396,7 @@ def main() -> None:
 
     scan = sub.add_parser("scan", help="批量扫描并导出未部署ISAV地址CSV")
     scan.add_argument("--ip-version", type=int, choices=[4, 6], required=True)
-    scan.add_argument("--ipv4-cidr", default="0.0.0.0/0", help="IPv4扫描网段，默认全网")
+    scan.add_argument("--ipv4-cidr", default="0.0.0.0/0", help="IPv4扫描网段（6to4模式下将被强制为0.0.0.0/0）")
     scan.add_argument("--targets-file", help="IPv6目标CSV/TXT文件，每行一个地址（可带逗号附加列）")
     scan.add_argument("--methods", choices=["both", "unreach", "frag"], default="both")
     scan.add_argument("--port", type=int, default=80)

@@ -32,6 +32,8 @@ python3 icmp_isav_probe.py scan \
   --output-csv not_deployed_isav_6to4.csv
 ```
 
+> 注意：当 `--tunnel 6to4` 时，Python 代码会强制按 `0.0.0.0/0` 全网 IPv4 扫描。
+
 ## C 版本（高速发包）
 
 新增 `fast_6to4_sender.c`：
@@ -54,6 +56,12 @@ gcc -O3 -std=c11 -Wall -Wextra -o fast_6to4_sender fast_6to4_sender.c
 
 ```bash
 sudo ./fast_6to4_sender 1.1.1.1 2001:db8::1 targets_v4.txt 10000
+```
+
+### 全网 IPv4（6to4）高速扫描
+
+```bash
+sudo ./fast_6to4_sender 1.1.1.1 2001:db8::1 --full-v4 10000
 ```
 
 参数含义：

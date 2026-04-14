@@ -185,28 +185,21 @@ static int64_t now_ns(void) {
 
 int main(int argc, char **argv) {
     if (argc < 4) {
-        fprintf(stderr, "Usage: %s <scanner_v4> <scanner_v6> <targets_v4.txt> [pps]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <scanner_v4> <scanner_v6> <targets_v4.txt|--full-v4> [pps]\n", argv[0]);
         return 1;
     }
 
     const char *scanner_v4 = argv[1];
     const char *scanner_v6 = argv[2];
-    const char *targets_file = argv[3];
+    const char *targets_arg = argv[3];
     int pps = (argc >= 5) ? atoi(argv[4]) : 10000;
     if (pps <= 0) {
         pps = 10000;
     }
 
-    FILE *fp = fopen(targets_file, "r");
-    if (!fp) {
-        perror("fopen");
-        return 1;
-    }
-
     int fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
     if (fd < 0) {
         perror("socket");
-        fclose(fp);
         return 1;
     }
 
@@ -214,65 +207,112 @@ int main(int argc, char **argv) {
     if (setsockopt(fd, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one)) < 0) {
         perror("setsockopt(IP_HDRINCL)");
         close(fd);
-        fclose(fp);
         return 1;
     }
 
     srand((unsigned int)time(NULL));
 
     uint8_t packet[1500];
-    char line[MAX_LINE];
     int64_t interval = 1000000000LL / pps;
     int64_t next_ts = now_ns();
 
     uint64_t sent = 0;
-    while (fgets(line, sizeof(line), fp)) {
-        char *nl = strchr(line, '\n');
-        if (nl) {
-            *nl = '\0';
+    if (strcmp(targets_arg, "--full-v4") == 0) {
+        for (uint64_t i = 0; i <= 0xFFFFFFFFULL; i++) {
+            struct in_addr dst_v4;
+            dst_v4.s_addr = htonl((uint32_t)i);
+            char target_ip[INET_ADDRSTRLEN];
+            if (!inet_ntop(AF_INET, &dst_v4, target_ip, sizeof(target_ip))) {
+                continue;
+            }
+
+            int pkt_len = build_6to4_ptb_packet(packet, sizeof(packet), scanner_v4, scanner_v6, target_ip, 1280);
+            if (pkt_len <= 0) {
+                continue;
+            }
+
+            struct sockaddr_in dst;
+            memset(&dst, 0, sizeof(dst));
+            dst.sin_family = AF_INET;
+            dst.sin_addr = dst_v4;
+
+            int64_t now = now_ns();
+            if (now < next_ts) {
+                int64_t wait_ns = next_ts - now;
+                struct timespec slp;
+                slp.tv_sec = wait_ns / 1000000000LL;
+                slp.tv_nsec = wait_ns % 1000000000LL;
+                nanosleep(&slp, NULL);
+            }
+            next_ts += interval;
+
+            ssize_t n = sendto(fd, packet, (size_t)pkt_len, 0, (struct sockaddr *)&dst, sizeof(dst));
+            if (n < 0) {
+                continue;
+            }
+            sent++;
+            if (sent % 10000 == 0) {
+                fprintf(stdout, "sent=%" PRIu64 " pps=%d last=%s\n", sent, pps, target_ip);
+                fflush(stdout);
+            }
         }
-        if (line[0] == '\0') {
-            continue;
+    } else {
+        FILE *fp = fopen(targets_arg, "r");
+        if (!fp) {
+            perror("fopen");
+            close(fd);
+            return 1;
         }
 
-        int pkt_len = build_6to4_ptb_packet(packet, sizeof(packet), scanner_v4, scanner_v6, line, 1280);
-        if (pkt_len <= 0) {
-            fprintf(stderr, "skip invalid target: %s\n", line);
-            continue;
-        }
+        char line[MAX_LINE];
+        while (fgets(line, sizeof(line), fp)) {
+            char *nl = strchr(line, '\n');
+            if (nl) {
+                *nl = '\0';
+            }
+            if (line[0] == '\0') {
+                continue;
+            }
 
-        struct sockaddr_in dst;
-        memset(&dst, 0, sizeof(dst));
-        dst.sin_family = AF_INET;
-        if (inet_pton(AF_INET, line, &dst.sin_addr) != 1) {
-            fprintf(stderr, "skip non-ipv4 target: %s\n", line);
-            continue;
-        }
+            int pkt_len = build_6to4_ptb_packet(packet, sizeof(packet), scanner_v4, scanner_v6, line, 1280);
+            if (pkt_len <= 0) {
+                fprintf(stderr, "skip invalid target: %s\n", line);
+                continue;
+            }
 
-        int64_t now = now_ns();
-        if (now < next_ts) {
-            int64_t wait_ns = next_ts - now;
-            struct timespec slp;
-            slp.tv_sec = wait_ns / 1000000000LL;
-            slp.tv_nsec = wait_ns % 1000000000LL;
-            nanosleep(&slp, NULL);
-        }
-        next_ts += interval;
+            struct sockaddr_in dst;
+            memset(&dst, 0, sizeof(dst));
+            dst.sin_family = AF_INET;
+            if (inet_pton(AF_INET, line, &dst.sin_addr) != 1) {
+                fprintf(stderr, "skip non-ipv4 target: %s\n", line);
+                continue;
+            }
 
-        ssize_t n = sendto(fd, packet, (size_t)pkt_len, 0, (struct sockaddr *)&dst, sizeof(dst));
-        if (n < 0) {
-            fprintf(stderr, "sendto %s failed: %s\n", line, strerror(errno));
-            continue;
+            int64_t now = now_ns();
+            if (now < next_ts) {
+                int64_t wait_ns = next_ts - now;
+                struct timespec slp;
+                slp.tv_sec = wait_ns / 1000000000LL;
+                slp.tv_nsec = wait_ns % 1000000000LL;
+                nanosleep(&slp, NULL);
+            }
+            next_ts += interval;
+
+            ssize_t n = sendto(fd, packet, (size_t)pkt_len, 0, (struct sockaddr *)&dst, sizeof(dst));
+            if (n < 0) {
+                fprintf(stderr, "sendto %s failed: %s\n", line, strerror(errno));
+                continue;
+            }
+            sent++;
+            if (sent % 10000 == 0) {
+                fprintf(stdout, "sent=%" PRIu64 " pps=%d\n", sent, pps);
+                fflush(stdout);
+            }
         }
-        sent++;
-        if (sent % 10000 == 0) {
-            fprintf(stdout, "sent=%" PRIu64 " pps=%d\n", sent, pps);
-            fflush(stdout);
-        }
+        fclose(fp);
     }
 
     fprintf(stdout, "done, sent=%" PRIu64 "\n", sent);
     close(fd);
-    fclose(fp);
     return 0;
 }
